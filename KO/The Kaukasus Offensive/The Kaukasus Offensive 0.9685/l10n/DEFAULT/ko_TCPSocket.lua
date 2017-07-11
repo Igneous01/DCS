@@ -1,0 +1,422 @@
+local require = require
+local loadfile = loadfile
+
+package.path = package.path..";.\\LuaSocket\\?.lua"
+package.cpath = package.cpath..";.\\LuaSocket\\?.dll"
+
+local JSON = loadfile("Scripts\\JSON.lua")()
+
+local socket = require("socket")
+
+koTCPSocket = {}
+
+--koTCPSocket.host = "localhost"
+koTCPSocket.host = "192.168.1.254"
+koTCPSocket.port = 9983
+koTCPSocket.JSON = JSON
+
+koTCPSocket.serverName = "unknown"
+koTCPSocket.txbufRaw = '{"type":"intro","serverName":"notstartedyet"}\n'
+koTCPSocket.txbuf = ''
+koTCPSocket.rxbuf = ''
+koTCPSocket.txTableBuf = {}			-- holds all runtime type of tables (savegame, radiolist, playerlist) which are NOT unique
+koTCPSocket.txScoreBuf = {}			-- holds all scores which are unique and need to be transmitted securely. Once transmitted, server will return the scoreID to be removed from the table, if server does not return the id, send it again!
+koTCPSocket.txScoreDelayBuf = {}	-- delay scores by 5 seconds before they are sent again!
+koTCPSocket.bufferFileName = lfs.writedir() .. "Missions\\The Kaukasus Offensive\\ko_TCPBuffer.lua"
+
+function koTCPSocket.startConnection()
+	koEngine.debugText("koTCPSocket.startconnection()")
+	-- start connection
+	koTCPSocket.connection = socket.tcp()
+	koTCPSocket.connection:settimeout(.0001)
+	env.info("koTCPSocket.startconnection() - Test Line")
+	local _r, _err = koTCPSocket.connection:connect(koTCPSocket.host, koTCPSocket.port)
+	
+
+	env.info("koTCPSocket.startConnection() - Connect Results: _r =  " .. tostring(_r) .. " _err: " .. tostring(_err))
+	
+	mist.scheduleFunction(koTCPSocket.transmit, nil, timer.getTime(), 0.01)
+	mist.scheduleFunction(koTCPSocket.receive, nil, timer.getTime()+0.5, 0.01)
+end
+
+
+function koTCPSocket.saveBuffer()
+	--koEngine.debugText("koTCPSocket.saveBuffer()")
+	
+	-- make sure to merge Score and ScoreDelay Buffer before save!
+	-- a score not confirmed saved has not been saved!
+	local exportTable = koTCPSocket.txScoreBuf
+	for i, score in ipairs(koTCPSocket.txScoreDelayBuf) do
+		table.insert(exportTable, score)
+	end
+	
+	local exportData = "local t = " .. koEngine.TableSerialization(exportTable) .. "return t"	
+	local exportFile = assert(io.open(koTCPSocket.bufferFileName, "w"))
+	exportFile:write(exportData)
+	exportFile:flush()
+	exportFile:close()
+	exportFile = nil
+end
+
+
+function koTCPSocket.loadBuffer()
+	koEngine.debugText("koTCPSocket.loadBuffer()")
+	local DataLoader = loadfile(koTCPSocket.bufferFileName)
+	if DataLoader ~= nil then		-- File open?
+		koEngine.debugText("successfully loaded table buffer from '"..koTCPSocket.bufferFileName.."'")
+		koTCPSocket.txScoreBuf = DataLoader()
+		
+		-- now make sure there is no more entrys in the buffer, in case the server crashes things could be messed up if transmitted twice ...
+		local exportFile = assert(io.open(koTCPSocket.bufferFileName, "w"))
+		exportFile:write("local t = {} return t")
+		exportFile:flush()
+		exportFile:close()
+		exportFile = nil
+	else
+		koEngine.debugText("could not load table buffer from '"..koTCPSocket.bufferFileName.."'")
+	end
+end
+
+function koTCPSocket.send(data, type)
+	-- temporarily disable
+	--if true then
+	--	return
+	--end
+	
+	koEngine.debugText("koTCPSocket.send(data: '"..type.."')")
+	local message = {
+		type = type,
+		data = data,
+		serverName = koTCPSocket.serverName,
+	}
+	
+	--koEngine.debugText("koTCPSocket.txTableBuf = "..koEngine.TableSerialization(koTCPSocket.txTableBuf))
+	
+	if type == "Score" then -- scores are unique
+		table.insert(koTCPSocket.txScoreBuf, message)
+	else
+		local inBuffer = false
+		
+		-- check if we have an older version in the buffer:
+		for i, entry in pairs(koTCPSocket.txTableBuf) do
+			--koEngine.debugText("entry = "..koEngine.TableSerialization(entry))
+			if entry.type == type then
+				koEngine.debugText(" - found an older version of '"..type.."', overwriting entry with latest version")
+				koTCPSocket.txTableBuf[i] = message
+				inBuffer = true
+			end
+		end
+		
+		if not inBuffer then
+			--koEngine.debugText("inserting into buffer")
+			table.insert(koTCPSocket.txTableBuf, message)
+		end
+	end
+	
+	
+	
+	--koTCPSocket.saveBuffer()
+	
+	--koTCPSocket.txbuf = koTCPSocket.txbuf..koTCPSocket.JSON:encode(message).."\n"
+end
+
+koTCPSocket.inTransit = false	-- 1 if we need to delete the entry from the buffer after it was sent, 0 if there is no object in the buffer to delete
+function koTCPSocket.transmit()
+	koEngine.debugText("koTCPSocket.transmit()")
+	
+	-- if scorebuffer is empty, check if we have sent scores that need to be sent again
+	if #koTCPSocket.txScoreBuf == 0 then
+		for i, msg in ipairs(koTCPSocket.txScoreDelayBuf) do
+			if (timer.getTime() - msg.sendTime) > 60 then	-- if message is older than 60 seconds, and still hasn't been confirmed by webserver, send it again!
+				env.info("koTCPSocket.transmit(): found score in delay buffer that is older than 60 seconds ... sending again!")
+				msg.sendTime = nil
+				table.insert(koTCPSocket.txScoreBuf, msg)
+				table.remove(koTCPSocket.txScoreDelayBuf, i)
+			end
+		end
+	end
+	
+	-- refresh score buffers
+	
+	-- we have an object cued (#txTableBuf > 0) and we did not just finish a transmission (not inTransit)
+	if koTCPSocket.txbuf:len() == 0 and #koTCPSocket.txScoreBuf > 0 and not koTCPSocket.inTransit then
+    env.info("koTCPSOCKET - SENDING SCORE DATA TO SERVER")
+    local jsonreq = koTCPSocket.JSON:encode(koTCPSocket.txScoreBuf[1])
+    local _msg = string.format("%06d", string.len(jsonreq)) .. jsonreq
+		koTCPSocket.txbuf = koTCPSocket.txbuf.._msg -- .."\n"  -- cue the next transmission
+		
+		-- now move the score back in the buffer, its going to be deleted 
+		local tmp = koTCPSocket.txScoreBuf[1]
+		tmp.sendTime = timer.getTime()
+		table.remove(koTCPSocket.txScoreBuf,1)
+		table.insert(koTCPSocket.txScoreDelayBuf, tmp)
+		
+	elseif koTCPSocket.txbuf:len() == 0 and #koTCPSocket.txTableBuf > 0 and not koTCPSocket.inTransit then
+    env.info("koTCPSOCKET - SENDING TABLE DATA TO SERVER")
+    local jsonreq = koTCPSocket.JSON:encode(koTCPSocket.txTableBuf[1])
+    local _msg = string.format("%06d", string.len(jsonreq)) .. jsonreq
+    
+		koTCPSocket.txbuf = koTCPSocket.txbuf.._msg --.."\n"  -- cue the next transmission
+		koTCPSocket.inTransit = true				-- we started a new transmission
+	
+	-- we have just finished a transmission (inTransit = true) and there is one more object in the txTableBuf (>1)
+  elseif koTCPSocket.txbuf:len() == 0 and #koTCPSocket.txTableBuf > 1 and koTCPSocket.inTransit then
+    env.info("koTCPSOCKET - SENDING NEXT TABLE DATA TO SERVER")
+		table.remove(koTCPSocket.txTableBuf,1) 		-- remove the just transmitted object and cue the next transmission
+    local jsonreq = koTCPSocket.JSON:encode(koTCPSocket.txTableBuf[1])
+    local _msg = string.format("%06d", string.len(jsonreq)) .. jsonreq
+		koTCPSocket.txbuf = koTCPSocket.txbuf .. _msg --.."\n"
+		
+	-- we have just finished a transmission (inTransit = true) and there is no more object in the txTableBuf (==0)
+	elseif koTCPSocket.txbuf:len() == 0 and #koTCPSocket.txTableBuf == 1 and koTCPSocket.inTransit then
+		table.remove(koTCPSocket.txTableBuf,1)		-- remove the just transmitted object
+		koTCPSocket.inTransit = false				-- no more transmissions
+	end
+	
+	
+	-- handle actual transmission
+	if koTCPSocket.txbuf:len() > 0 then
+		--koEngine.debugText("koTCPSocket.transmit() - buffer available, sending ...")
+		
+    env.info("koTCPSocket Line 166: length of txBuf: " .. tostring(string.len(koTCPSocket.txbuf)))
+    
+		--[[local _msg = ""
+    if koTCPSocket.inTransit == false then
+      env.info("koTCPSocket - new transmission - appending length header")
+      --_msg = string.format("%06d", _msgSize) .. koTCPSocket.txbuf
+    else
+      env.info("koTCPSocket - existing transmission - not appending header")
+      --_msg = koTCPSocket.txbuf
+    end]]--
+		local bytes_sent = 0
+    --[[local ret1, ret2, ret3
+    while (bytes_sent < _msgSize) do
+      env.info("koTCPSocket - NOT ALL BYTES SENT - SENDING AGAIN (Current Bytes Sent: " .. tostring(bytes_sent) .. ")")
+      ret1, ret2, ret3 = koTCPSocket.connection:send(_msg)
+      if ret3 then
+        bytes_sent = bytes_sent + ret3
+      else
+        env.info("koTCPSocket - socket send failed - breaking from loop")
+        break
+      end
+    end]]--
+		local ret1, ret2, ret3 = koTCPSocket.connection:send(koTCPSocket.txbuf)
+		if ret1 then
+			--koEngine.debugText(" - Transmission complete!")
+      bytes_sent = ret1
+			koEngine.debugText("bytes sent: "..tostring(bytes_sent))
+			koEngine.debugText(" - sent string: '"..koTCPSocket.txbuf:sub(1, bytes_sent).."'")
+		else
+			koEngine.debugText("could not send koTCPSocket: "..ret2)
+			if ret3 == 0 then
+				if ret2 == "closed" then
+					if MissionData then
+						koTCPSocket.txbuf = koTCPSocket.txbuf .. 
+                                string.format("%06d", string.len(koTCPSocket.txbufRaw)) ..
+                                koTCPSocket.txbufRaw --..'\n'
+					else
+						koTCPSocket.txbuf = koTCPSocket.txbuf .. '000016{"type":"dummy"}'
+					end
+					koTCPSocket.rxbuf = ""
+					koTCPSocket.connection = socket.tcp()
+					koTCPSocket.connection:settimeout(.0001)
+					koEngine.debugText("koTCPSocket: socket was closed")
+				end
+				--koEngine.debugText("reconnecting to "..tostring(koTCPSocket.host)..":"..tostring(koTCPSocket.port))
+				koTCPSocket.connection:connect(koTCPSocket.host, koTCPSocket.port)
+				return
+			end
+			bytes_sent = ret3
+			koEngine.debugText("bytes sent: "..tostring(bytes_sent))
+			koEngine.debugText(" - sent string: '"..koTCPSocket.txbuf:sub(1, bytes_sent).."'")
+		end
+		koTCPSocket.txbuf = koTCPSocket.txbuf:sub(bytes_sent + 1)
+    env.info("koTCPSocket: Remaining buffer length: " .. tostring(string.len(koTCPSocket.txbuf)) .. " data : '" .. koTCPSocket.txbuf .."'")
+	end
+end
+
+-- copy of transmit()
+-- does not stop until every score is transmitted, unless a connection error occured
+function koTCPSocket.forceTransmit()
+	koEngine.debugText("koTCPSocket.forceTransmit()")
+	
+	while koTCPSocket.txbuf:len() > 0 or #koTCPSocket.txScoreBuf > 0 or #koTCPSocket.txTableBuf > 0  do
+		koEngine.debugText(" - forced loop")
+		-- if scorebuffer is empty, check if we have sent scores that need to be sent again
+		
+		-- handle empty txbuf
+		-- we have an object cued (#txTableBuf > 0) and we did not just finish a transmission (not inTransit)
+		if koTCPSocket.txbuf:len() == 0 and #koTCPSocket.txScoreBuf > 0 and not koTCPSocket.inTransit then
+			koEngine.debugText("  - sending next score")
+      local jsonreq = koTCPSocket.JSON:encode(koTCPSocket.txScoreBuf[1])
+      local _msg = string.format("%06d", string.len(jsonreq)) .. jsonreq
+			koTCPSocket.txbuf = koTCPSocket.txbuf .. _msg --.."\n"  -- cue the next transmission
+			
+			-- now move the score back in the buffer, its going to be deleted 
+			local tmp = koTCPSocket.txScoreBuf[1]
+			tmp.sendTime = timer.getTime()
+			table.remove(koTCPSocket.txScoreBuf,1)
+			table.insert(koTCPSocket.txScoreDelayBuf, tmp)
+			
+		elseif koTCPSocket.txbuf:len() == 0 and #koTCPSocket.txTableBuf > 0 and not koTCPSocket.inTransit then
+			koEngine.debugText("  - now starting to send tables")
+      local jsonreq = koTCPSocket.JSON:encode(koTCPSocket.txTableBuf[1])
+      local _msg = string.format("%06d", string.len(jsonreq)) .. jsonreq
+			koTCPSocket.txbuf = koTCPSocket.txbuf .. _msg --.."\n"  -- cue the next transmission
+			koTCPSocket.inTransit = true				-- we started a new transmission
+		
+		-- we have just finished a transmission (inTransit = true) and there is one more object in the txTableBuf (>1)
+		elseif koTCPSocket.txbuf:len() == 0 and #koTCPSocket.txTableBuf > 1 and koTCPSocket.inTransit then
+			koEngine.debugText("  - sending next table")
+			table.remove(koTCPSocket.txTableBuf,1) 		-- remove the just transmitted object and cue the next transmission
+      local jsonreq = koTCPSocket.JSON:encode(koTCPSocket.txTableBuf[1])
+      local _msg = string.format("%06d", string.len(jsonreq)) .. jsonreq
+			koTCPSocket.txbuf = koTCPSocket.txbuf .. _msg --.."\n"
+			
+		-- we have just finished a transmission (inTransit = true) and there is no more object in the txTableBuf (==0)
+		elseif koTCPSocket.txbuf:len() == 0 and #koTCPSocket.txTableBuf == 1 and koTCPSocket.inTransit then
+			koEngine.debugText("  - finished sending next table")
+			table.remove(koTCPSocket.txTableBuf,1)		-- remove the just transmitted object
+			koTCPSocket.inTransit = false				-- no more transmissions
+		end
+		
+		
+		-- actual sending code
+		if koTCPSocket.txbuf:len() > 0 then
+			--koEngine.debugText("koTCPSocket.transmit() - buffer available, sending ...")
+			local bytes_sent = nil
+			local ret1, ret2, ret3 = koTCPSocket.connection:send(koTCPSocket.txbuf)
+			if ret1 then
+				--koEngine.debugText(" - Transmission complete!")
+				bytes_sent = ret1
+			else
+				koEngine.debugText("could not send koTCPSocket: "..ret2)
+				if ret3 == 0 then
+					koEngine.debugText("WARNING - Could not force-send data, saving buffer and giving up.")
+					koTCPSocket.saveBuffer()
+					return -- if no bytes have been sent, return the function and give up forcing the transmission
+				end
+				bytes_sent = ret3
+				koEngine.debugText("bytes sent: "..tostring(bytes_sent))
+			end
+			koEngine.debugText(" - sent string: '"..koTCPSocket.txbuf:sub(1, bytes_sent).."'")
+			koTCPSocket.txbuf = koTCPSocket.txbuf:sub(bytes_sent + 1)
+		end
+		
+		-- call receive to clear transmitted scores
+		koTCPSocket.receive()
+	end
+	
+	koEngine.debugText("- forced transmission successfull!")
+	-- save buffer when finished, to save delayed scores that have not yet been acknoledged
+	koTCPSocket.saveBuffer()
+end
+
+function koTCPSocket.receive()
+	--env.info("koTCPSocket.receive()")	
+	local line, err, partRes = koTCPSocket.connection:receive('*l')
+	
+	if partRes and partRes:len() > 0 then
+		--env.info("koTCPSocket.receive(), partRes = '"..tostring(partRes).."'")
+		
+		koTCPSocket.rxbuf = koTCPSocket.rxbuf .. partRes
+		env.info("koTCPSocket.receive() - partRes = '"..partRes.."'")
+		
+		local line = koTCPSocket.rxbuf:sub(1, koTCPSocket.rxbuf:find("\\n")-1)
+		koTCPSocket.rxbuf = koTCPSocket.rxbuf:sub(koTCPSocket.rxbuf:find("\\n")+2, -1)
+		
+		while line:len() > 0 do
+			local msg = JSON:decode(line)
+			--env.info("koTCPSocket.receive(): msg = "..koEngine.TableSerialization(msg))
+			
+			if msg.type == "alive" then
+				env.info("koTCPSocket.receive() - Alive packet received and returned")
+				koTCPSocket.txbuf = koTCPSocket.txbuf .. '{"type":"alive","serverName":"'..koTCPSocket.serverName..'"}\n'
+			elseif msg.type == "scoreReceived" then
+				env.info("koTCPSocket.receive() - scoreID '"..msg.scoreID.."' received, checking buffer!")
+				--env.info("txScoreBuf = "..koEngine.TableSerialization(txScoreBuf))
+				for i, scoreTable in ipairs(koTCPSocket.txScoreBuf) do
+					for ucid, score in pairs(scoreTable.data) do
+						--env.info("score = "..koEngine.TableSerialization(score))
+						--env.info("comparing "..score.scoreID.." with "..msg.scoreID)
+						if tonumber(score.scoreID) == tonumber(msg.scoreID) then
+							table.remove(koTCPSocket.txScoreBuf, i)
+							env.info("- found score in table, removed index "..i)
+						end
+					end 
+				end
+				for i, scoreTable in ipairs(koTCPSocket.txScoreDelayBuf) do
+					for ucid, score in pairs(scoreTable.data) do
+						if tonumber(score.scoreID) == tonumber(msg.scoreID) then
+							table.remove(koTCPSocket.txScoreDelayBuf, i)
+							env.info("- found score in delay-table, removed index "..i)
+						end
+					end 
+				end
+			end
+			
+			if koTCPSocket.rxbuf:len() > 0 and koTCPSocket.rxbuf:find("\\n") then
+				line = koTCPSocket.rxbuf:sub(1, koTCPSocket.rxbuf:find("\\n")-1)
+				koTCPSocket.rxbuf = koTCPSocket.rxbuf:sub(koTCPSocket.rxbuf:find("\\n")+2, -1)
+				
+				env.info("koTCPSocket.receive() - rxbuf in loop = '"..koTCPSocket.rxbuf.."'")
+			else 
+				line = ""
+			end
+		end
+	end 
+	
+	--[[ if err then
+		--env.info("koTCPSocket read error: "..err..", line = '"..tostring(line).."'")
+		if not err == "timeout" then 
+			env.info("koTCPSocket read error: "..err)
+		end
+	elseif line then
+		local msg = JSON:decode(line)
+		env.info("koTCPSocket.receive(): msg = "..koEngine.TableSerialization(msg))
+		
+		if msg.type == "alive" then
+			env.info("Alive packet received and returned")
+			koTCPSocket.txbuf = koTCPSocket.txbuf .. '{"type":"alive","serverName":"'..koTCPSocket.serverName..'"}\n'
+		end
+		-------------------------
+		-- example code, expects lua code to be received and returns result string
+		-- 
+		if msg.type == "lua" then
+			local response_msg = {}
+			response_msg.type = "luaresult"
+			response_msg.name = msg.name
+			local f, error_msg = loadstring(msg.code, msg.name)
+			if f then
+				koTCPSocket.context = {}
+				koTCPSocket.context.arg = msg.arg
+				setfenv(f, koTCPSocket.mission_env)
+				response_msg.success, response_msg.result = pcall(f)
+			else
+				response_msg.success = false
+				response_msg.result = tostring(error_msg)
+			end
+			
+			local response_string = ""
+			local function encode_response()
+				response_string = JSON:encode(response_msg):gsub("\n","").."\n"
+			end
+			
+			local success, result = pcall(encode_response)
+			if not success then
+				response_msg.success = false
+				response_msg.result = tostring(result)
+				encode_response()
+			end
+			
+			koTCPSocket.txbuf = koTCPSocket.txbuf .. response_string
+		end 
+	end--]]
+end
+
+function koTCPSocket.close(reason)
+	koTCPSocket.send({reason = "reason"},"shutdown")
+	koTCPSocket.connection:close()
+end
+
+env.info("koTCPSocket loaded")

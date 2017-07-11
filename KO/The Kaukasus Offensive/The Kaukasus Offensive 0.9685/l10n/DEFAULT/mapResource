@@ -1,0 +1,18 @@
+mapResource = 
+{
+    [""] = "ko_data.lua",
+    ["ResKey_Action_2652"] = "ko_data.lua",
+    ["ResKey_Action_2551"] = "CTLD_ko.lua",
+    ["ResKey_ImageBriefing_9033"] = "ko_splash1.jpg",
+    ["ResKey_Action_8278"] = "DCS-SRSAutokickerMissionScript.lua",
+    ["ResKey_Action_2552"] = "beacon.ogg",
+    ["ResKey_Action_2649"] = "ko_Engine2.lua",
+    ["ResKey_Action_2553"] = "beaconsilent.ogg",
+    ["ResKey_Action_6317"] = "ko_CSAR.lua",
+    ["ResKey_Action_9030"] = "mist_ko.lua",
+    ["ResKey_Action_8868"] = "EWRS.lua",
+    ["ResKey_Action_6803"] = "ko_Scoreboard.lua",
+    ["ResKey_ImageBriefing_7488"] = "ko Briefing 1.jpg",
+    ["ResKey_ImageBriefing_8856"] = "ko_splash.jpg",
+    ["ResKey_Action_8867"] = "ko_TCPSocket.lua",
+} -- end of mapResource
