@@ -80,3 +80,6 @@ KI/KI_TCPServer/TAWKI_TCPServer/bin/Debug/Newtonsoft.Json.xml
 KI/KI_TCPServer/TAWKI_TCPServer/bin/Debug/Newtonsoft.Json.pdb
 KI/KI_TCPServer/TAWKI_TCPServer/obj/Debug/TAWKI_TCPServer.csproj.CopyComplete
 *.pdb
+KI/WebServer/KIWebServer/KIWebApp/obj/Debug/KIWebApp.csproj.FileListAbsolute.txt
+KI/WebServer/KIWebServer/KIWebApp/obj/Debug/KIWebApp.dll
+KI/WebServer/KIWebServer/KIWebApp/obj/Debug/KIWebApp.pdb
